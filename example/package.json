@@ -4,8 +4,8 @@
   "private": true,
   "scripts": {
     "android": "react-native run-android",
-    "ios": "react-native run-ios --simulator=\"iPhone 15 Pro\"",
-    "open:ios" : "open ios/example.xcworkspace",
+    "ios": "react-native run-ios --simulator=\"iPhone 16 Pro\"",
+    "open:ios": "open ios/example.xcworkspace",
     "start": "react-native start",
     "test": "jest",
     "lint": "eslint .",
@@ -14,7 +14,7 @@
     "fresh": "yarn start --reset-cache"
   },
   "dependencies": {
-    "@kesha-antonov/react-native-background-downloader": "^3.2.5",
+    "@kesha-antonov/react-native-background-downloader": "file:..",
     "@react-native-community/slider": "^4.5.0",
     "@react-navigation/native": "^6.1.16",
     "@react-navigation/stack": "^6.3.28",
@@ -60,7 +60,6 @@
     "prettier": "^3.2.5",
     "react-test-renderer": "18.2.0",
     "typescript": "5.4.2"
-
   },
   "engines": {
     "node": ">=16"
