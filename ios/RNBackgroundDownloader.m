@@ -4,6 +4,7 @@
 
 #define ID_TO_CONFIG_MAP_KEY @"com.eko.bgdownloadidmap"
 #define PROGRESS_INTERVAL_KEY @"progressInterval"
+#define PROGRESS_MIN_BYTES_KEY @"progressMinBytes"
 
 // DISABLES LOGS IN RELEASE MODE. NSLOG IS SLOW: https://stackoverflow.com/a/17738695/3452513
 #ifdef DEBUG
@@ -25,6 +26,7 @@ static CompletionHandler storedCompletionHandler;
     NSMutableDictionary<NSString *, NSNumber *> *idToPercentMap;
     NSMutableDictionary<NSString *, NSDictionary *> *progressReports;
     float progressInterval;
+    int64_t progressMinBytes;
     NSDate *lastProgressReportedAt;
     BOOL isBridgeListenerInited;
     BOOL isJavascriptLoaded;
@@ -48,6 +50,32 @@ RCT_EXPORT_MODULE();
         @"downloadComplete",
         @"downloadFailed"
     ];
+}
+
+- (void)startObserving {
+    self.hasListeners = YES;
+    [self flushPendingEvents];
+}
+
+- (void)stopObserving {
+  self.hasListeners = NO;
+}
+
+- (void)enqueueEvent:(NSString *)name body:(NSDictionary *)body {
+    DLog(@"[RNBackgroundDownloader] - [enqueueEvent] %@ %@", name, @(self.hasListeners));
+    if (self.hasListeners) {
+        [self sendEventWithName:name body:body];
+    } else {
+        [self.pendingEvents addObject:@{ @"name": name, @"body": body ?: @{} }];
+    }
+}
+
+- (void)flushPendingEvents {
+    if (!self.hasListeners || self.pendingEvents.count == 0) return;
+    for (NSDictionary *evt in self.pendingEvents) {
+        [self sendEventWithName:evt[@"name"] body:evt[@"body"]];
+    }
+    [self.pendingEvents removeAllObjects];
 }
 
 - (NSDictionary *)constantsToExport {
@@ -97,6 +125,8 @@ RCT_EXPORT_MODULE();
         float progressIntervalScope = [mmkv getFloatForKey:PROGRESS_INTERVAL_KEY];
         progressInterval = isnan(progressIntervalScope) ? 1.0 : progressIntervalScope;
         lastProgressReportedAt = [[NSDate alloc] init];
+
+        _pendingEvents = [NSMutableArray new];
 
         [self registerBridgeListener];
     }
@@ -219,8 +249,14 @@ RCT_EXPORT_METHOD(download: (NSDictionary *) options) {
 
     NSNumber *progressIntervalScope = options[@"progressInterval"];
     if (progressIntervalScope) {
-        progressInterval = [progressIntervalScope intValue] / 1000;
+        progressInterval = [progressIntervalScope floatValue] / 1000;
         [mmkv setFloat:progressInterval forKey:PROGRESS_INTERVAL_KEY];
+    }
+
+    NSNumber *progressMinBytesScope = options[@"progressMinBytes"];
+    if (progressMinBytesScope) {
+        progressMinBytes = [progressMinBytesScope longLongValue];
+        [mmkv setInt64:progressMinBytes forKey:PROGRESS_MIN_BYTES_KEY];
     }
 
     NSString *destinationRelative = [self getRelativeFilePathFromPath:destination];
@@ -304,15 +340,38 @@ RCT_EXPORT_METHOD(stopTask: (NSString *)identifier) {
 }
 
 RCT_EXPORT_METHOD(completeHandler:(nonnull NSString *)jobId resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
-    DLog(@"[RNBackgroundDownloader] - [completeHandlerIOS]");
-    [[NSOperationQueue mainQueue] addOperationWithBlock:^{
-        if (storedCompletionHandler) {
-            storedCompletionHandler();
-            storedCompletionHandler = nil;
-        }
-    }];
+    DLog(@"[RNBackgroundDownloader] - [completeHandlerIOS] jobId: %@", jobId);
 
-    resolve(nil);
+    // Defensive programming: Check if we have valid parameters
+    if (!jobId || !resolve) {
+        DLog(@"[RNBackgroundDownloader] - [completeHandlerIOS] Invalid parameters");
+        if (reject) {
+            reject(@"invalid_params", @"Invalid parameters provided to completeHandler", nil);
+        }
+        return;
+    }
+
+    // Ensure we're on main queue for completion handler execution
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            DLog(@"[RNBackgroundDownloader] - [completeHandlerIOS] Executing completion handler");
+            if (storedCompletionHandler) {
+                storedCompletionHandler();
+                storedCompletionHandler = nil;
+                DLog(@"[RNBackgroundDownloader] - [completeHandlerIOS] Completion handler executed successfully");
+            } else {
+                DLog(@"[RNBackgroundDownloader] - [completeHandlerIOS] No stored completion handler found");
+            }
+
+            // Resolve the promise
+            resolve(nil);
+        } @catch (NSException *exception) {
+            DLog(@"[RNBackgroundDownloader] - [completeHandlerIOS] Exception: %@", exception);
+            if (reject) {
+                reject(@"completion_handler_error", exception.reason ?: @"Unknown error in completion handler", nil);
+            }
+        }
+    });
 }
 
 RCT_EXPORT_METHOD(checkForExistingDownloads: (RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
@@ -398,24 +457,22 @@ RCT_EXPORT_METHOD(checkForExistingDownloads: (RCTPromiseResolveBlock)resolve rej
                 [self saveFile:taskConfig downloadURL:location error:&error];
             }
 
-            if (self.bridge && isJavascriptLoaded) {
-                if (error == nil) {
-                    NSDictionary *responseHeaders = ((NSHTTPURLResponse *)downloadTask.response).allHeaderFields;
-                    [self sendEventWithName:@"downloadComplete" body:@{
-                        @"id": taskConfig.id,
-                        @"headers": responseHeaders,
-                        @"location": taskConfig.destination,
-                        @"bytesDownloaded": [NSNumber numberWithLongLong:downloadTask.countOfBytesReceived],
-                        @"bytesTotal": [NSNumber numberWithLongLong:downloadTask.countOfBytesExpectedToReceive]
-                    }];
-                } else {
-                    [self sendEventWithName:@"downloadFailed" body:@{
-                        @"id": taskConfig.id,
-                        @"error": [error localizedDescription],
-                        // TODO
-                        @"errorCode": @-1
-                    }];
-                }
+            if (error == nil) {
+                NSDictionary *responseHeaders = ((NSHTTPURLResponse *)downloadTask.response).allHeaderFields;
+                [self enqueueEvent:@"downloadComplete" body:@{
+                    @"id": taskConfig.id,
+                    @"headers": responseHeaders,
+                    @"location": taskConfig.destination,
+                    @"bytesDownloaded": [NSNumber numberWithLongLong:downloadTask.countOfBytesReceived],
+                    @"bytesTotal": [NSNumber numberWithLongLong:downloadTask.countOfBytesExpectedToReceive]
+                }];
+            } else {
+                [self enqueueEvent:@"downloadFailed" body:@{
+                    @"id": taskConfig.id,
+                    @"error": [error localizedDescription],
+                    // TODO
+                    @"errorCode": @-1
+                }];
             }
 
             [self removeTaskFromMap:downloadTask];
@@ -439,13 +496,11 @@ RCT_EXPORT_METHOD(checkForExistingDownloads: (RCTPromiseResolveBlock)resolve rej
         if (taskConfig != nil) {
             if (!taskConfig.reportedBegin) {
                 NSDictionary *responseHeaders = ((NSHTTPURLResponse *)downloadTask.response).allHeaderFields;
-                if (self.bridge && isJavascriptLoaded) {
-                    [self sendEventWithName:@"downloadBegin" body:@{
-                        @"id": taskConfig.id,
-                        @"expectedBytes": [NSNumber numberWithLongLong: bytesTotalExpectedToWrite],
-                        @"headers": responseHeaders
-                    }];
-                }
+                [self enqueueEvent:@"downloadBegin" body:@{
+                    @"id": taskConfig.id,
+                    @"expectedBytes": [NSNumber numberWithLongLong: bytesTotalExpectedToWrite],
+                    @"headers": responseHeaders
+                }];
                 taskConfig.reportedBegin = YES;
             }
 
@@ -462,12 +517,12 @@ RCT_EXPORT_METHOD(checkForExistingDownloads: (RCTPromiseResolveBlock)resolve rej
 
             NSDate *now = [[NSDate alloc] init];
             if ([now timeIntervalSinceDate:lastProgressReportedAt] > progressInterval && progressReports.count > 0) {
-                if (self.bridge && isJavascriptLoaded) {
-                    [self sendEventWithName:@"downloadProgress" body:[progressReports allValues]];
-                }
+                [self enqueueEvent:@"downloadProgress" body:[progressReports allValues]];
                 lastProgressReportedAt = now;
                 [progressReports removeAllObjects];
             }
+        } else {
+            DLog(@"[RNBackgroundDownloader] - [didWriteData] taskConfig is nil");
         }
     }
 }
@@ -487,14 +542,12 @@ RCT_EXPORT_METHOD(checkForExistingDownloads: (RCTPromiseResolveBlock)resolve rej
         // -999 code represents incomplete tasks.
         // Required to continue resume tasks.
         if (error.code != -999) {
-            if (self.bridge && isJavascriptLoaded) {
-                [self sendEventWithName:@"downloadFailed" body:@{
-                    @"id": taskConfig.id,
-                    @"error": [error localizedDescription],
-                    // TODO
-                    @"errorCode": @-1
-                }];
-            }
+            [self enqueueEvent:@"downloadFailed" body:@{
+                @"id": taskConfig.id,
+                @"error": [error localizedDescription],
+                // TODO
+                @"errorCode": @-1
+            }];
             [self removeTaskFromMap:task];
         }
     }

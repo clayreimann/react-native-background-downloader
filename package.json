@@ -42,7 +42,8 @@
     "lint": "eslint .",
     "prepublishOnly": "jest && npm run lint",
     "publish": "npm publish",
-    "test": "jest"
+    "test": "jest",
+    "pack": "npm run clean:plugin && npm run build:plugin && npm pack"
   },
   "lint-staged": {
     "*.js": "eslint --cache"
